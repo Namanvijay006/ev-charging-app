@@ -164,3 +164,5 @@ input[type=text], input[type=email], input[type=time], input[type=number], selec
   background: #fff; color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
   padding: 1px 6px; font-size: 12px; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.2);
 }
+
+.mini-map { height: 230px; border-radius: 10px; border: 1px solid var(--line); z-index: 0; }

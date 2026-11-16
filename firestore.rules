@@ -65,6 +65,19 @@ service cloud.firestore {
       allow read, update, delete: if isAdmin();
     }
 
+    // Chargers that people say are missing from the map. Anyone may send one;
+    // only admins can read them.
+    match /stationSuggestions/{suggestionId} {
+      allow create: if request.resource.data.keys().hasOnly(['name', 'lat', 'lng', 'kw', 'wheels', 'uid', 'status', 'createdAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 80
+        && request.resource.data.lat is number && request.resource.data.lng is number
+        && request.resource.data.wheels is list && request.resource.data.wheels.size() >= 1 && request.resource.data.wheels.size() <= 3
+        && (request.resource.data.kw == null || request.resource.data.kw is number)
+        && request.resource.data.status == 'new'
+        && (request.resource.data.uid == null || (signedIn() && request.resource.data.uid == request.auth.uid));
+      allow read, update, delete: if isAdmin();
+    }
+
     match /reports/{reportId} {
       allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
       allow read, update: if isAdmin();

@@ -33,7 +33,7 @@ const state = {
   user: null, profile: null, pos: null,
   filters: { plug: '', fast: false, bookable: false },
   radius: 1, browse: false,
-  markers: new Map(), unsubSlots: null,
+  markers: new Map(), unsubSlots: null, miniMap: null,
 };
 
 // ---------- helpers ----------
@@ -188,7 +188,7 @@ function renderList(near, nearest) {
         <div class="muted small-text">${d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`}${kw ? ` · up to ${kw} kW` : ''}${price ? ` · ₹${price}/kWh` : ''}</div>
         ${isBookable(s) ? '<span class="badge neutral">Book a slot</span>' : ''}
       </button>`;
-    }).join('');
+    }).join('') + '<div class="actions" style="justify-content:center"><button class="btn small ghost" data-missing>Know a charger that is missing? Tell us</button></div>';
     return;
   }
   const wider = nearest ? RADII.find((r) => r > state.radius && r >= nearest.d) : null;
@@ -204,12 +204,14 @@ $('station-list').onclick = (e) => {
   const w = e.target.closest('[data-widen]'); if (w) return setRadius(Number(w.dataset.widen));
   const g = e.target.closest('[data-goto]');
   if (g) { const s = state.byId.get(g.dataset.goto); state.browse = true; map.setView([s.lat, s.lng], 14); refresh(); return openStation(s.id); }
-  if (e.target.closest('[data-missing]')) openFeedback();
+  if (e.target.closest('[data-missing]')) openMissingCharger();
 };
 
 // ---------- sheet ----------
-function openSheet(html) { $('sheet-body').innerHTML = html; $('sheet').hidden = false; }
+function dropMiniMap() { if (state.miniMap) { state.miniMap.remove(); state.miniMap = null; } }
+function openSheet(html) { dropMiniMap(); $('sheet-body').innerHTML = html; $('sheet').hidden = false; }
 function closeSheet() {
+  dropMiniMap();
   $('sheet').hidden = true;
   if (state.unsubSlots) { state.unsubSlots(); state.unsubSlots = null; }
 }
@@ -597,15 +599,75 @@ async function wantBooking(s, btn) {
   } catch (e) { console.error(e); btn.disabled = false; toast('Could not send. Try again.'); }
 }
 
+// ---------- suggest a missing charger ----------
+function openMissingCharger() {
+  const startAt = state.pos || [map.getCenter().lat, map.getCenter().lng];
+  const wheels = new Set();
+  openSheet(`<h2>Add a missing charger</h2>
+    <p class="muted">Tell us about a charger we do not show. We will check it and add it to the map.</p>
+    <label>Charging company or place name</label>
+    <input type="text" id="mc-name" maxlength="80" placeholder="For example: Tata Power, Statiq or Hotel Sunrise">
+    <label>Where is it? Drag the pin, or tap the map, to mark the exact spot.</label>
+    <div id="mc-map" class="mini-map"></div>
+    <button class="btn small ghost" id="mc-here" style="margin-top:8px">Use my current location</button>
+    <label>Suitable for (choose all that apply)</label>
+    <div class="rating" id="mc-wheels">
+      <button data-w="2">2-wheeler</button><button data-w="3">3-wheeler</button><button data-w="4">4-wheeler</button>
+    </div>
+    <label>Power in kW (optional)</label>
+    <input type="number" id="mc-kw" min="0" max="500" step="0.1" inputmode="decimal" placeholder="For example: 3.3, 7.4 or 60">
+    <div class="actions"><button class="btn" id="mc-send">Send</button></div>`);
+
+  const mini = L.map('mc-map', { attributionControl: false }).setView(startAt, 16);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(mini);
+  const pin = L.marker(startAt, { draggable: true }).addTo(mini);
+  mini.on('click', (e) => pin.setLatLng(e.latlng));
+  state.miniMap = mini;
+  setTimeout(() => mini.invalidateSize(), 50);
+
+  $('mc-here').onclick = () => {
+    if (!navigator.geolocation) return toast('Location is not available on this device.');
+    navigator.geolocation.getCurrentPosition((p) => {
+      const here = [p.coords.latitude, p.coords.longitude];
+      pin.setLatLng(here); mini.setView(here, 17);
+    }, () => toast('Could not get your location. Drag the pin instead.'), { enableHighAccuracy: true, timeout: 8000 });
+  };
+  $('mc-wheels').onclick = (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    const w = Number(b.dataset.w);
+    if (wheels.has(w)) wheels.delete(w); else wheels.add(w);
+    b.classList.toggle('on', wheels.has(w));
+  };
+  $('mc-send').onclick = async () => {
+    const name = $('mc-name').value.trim().slice(0, 80);
+    if (!name) return toast('Please enter the company or place name.');
+    if (!wheels.size) return toast('Please choose 2, 3 or 4-wheeler.');
+    const kwRaw = $('mc-kw').value.trim();
+    const kw = kwRaw === '' ? null : Number(kwRaw);
+    if (kw !== null && !(kw > 0 && kw <= 500)) return toast('Power should be a number between 0 and 500 kW, or left empty.');
+    const at = pin.getLatLng();
+    $('mc-send').disabled = true;
+    try {
+      await addDoc(collection(db, 'stationSuggestions'), {
+        name, lat: Number(at.lat.toFixed(6)), lng: Number(at.lng.toFixed(6)), kw,
+        wheels: [...wheels].sort(), uid: state.user?.uid || null, status: 'new', createdAt: Date.now(),
+      });
+      track('missing_charger_sent', { wheels: [...wheels].sort().join('') });
+      toast('Thank you! We will check it and add it.'); closeSheet();
+    } catch (e) { console.error(e); toast('Could not send. Try again.'); if ($('mc-send')) $('mc-send').disabled = false; }
+  };
+}
+
 // ---------- admin dashboard ----------
 async function renderAdmin() {
   const el = $('admin');
   if (!isAdmin()) { el.innerHTML = '<div class="empty">Admins only.</div>'; return; }
   el.innerHTML = '<p class="muted">Loading…</p>';
   try {
-    const [u, b, f, r] = await Promise.all(['users', 'bookings', 'feedback', 'reports'].map((c) => getDocs(collection(db, c))));
+    const [u, b, f, r, sg] = await Promise.all(['users', 'bookings', 'feedback', 'reports', 'stationSuggestions'].map((c) => getDocs(collection(db, c))));
     const rows = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     const users = rows(u), bookings = rows(b), feedback = rows(f), reports = rows(r);
+    const suggestions = rows(sg).filter((x) => x.status !== 'done');
     const now = Date.now(), week = now - 7 * 864e5;
     const when = (ms) => (ms ? new Date(ms).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '');
     const newest = (list) => [...list].sort((a, c) => (c.createdAt || 0) - (a.createdAt || 0));
@@ -632,10 +694,17 @@ async function renderAdmin() {
         ${tile(bookings.filter((x) => x.status === 'no_show').length, 'No-shows')}
         ${tile(avg, `Average rating (${rated.length} answers)`)}
         ${tile(openReports.length, 'Open problem reports')}
+        ${tile(suggestions.length, 'Missing chargers suggested')}
       </div>
 
       <h3>Stations people want to book (${topWants.length})</h3>
       <div class="rows">${topWants.map(([name, n]) => `<div class="rowline"><strong>${n}×</strong> ${esc(name)}</div>`).join('') || '<p class="muted">No requests yet.</p>'}</div>
+
+      <h3>Missing chargers people suggested (${suggestions.length})</h3>
+      <div class="rows">${newest(suggestions).slice(0, 50).map((x) => `<div class="rowline"><strong>${esc(x.name)}</strong>
+        · ${esc((x.wheels || []).map((w) => `${w}-wheeler`).join(', '))}${x.kw ? ` · ${esc(x.kw)} kW` : ''}
+        <div class="muted small-text">${esc(when(x.createdAt))} · <a href="https://www.google.com/maps?q=${Number(x.lat)},${Number(x.lng)}" target="_blank" rel="noopener">Open location in Google Maps</a></div>
+        <button class="btn small ghost" data-sugdone="${esc(x.id)}" style="margin-top:6px">Mark as handled</button></div>`).join('') || '<p class="muted">No suggestions yet.</p>'}</div>
 
       <h3>Latest feedback</h3>
       <div class="rows">${newest(feedback.filter((x) => x.type === 'feedback')).slice(0, 30).map((x) => `<div class="rowline">
@@ -655,6 +724,14 @@ async function renderAdmin() {
       <div class="rows">${newest(bookings).slice(0, 30).map((x) => `<div class="rowline"><strong>${esc(x.stationName)}</strong> · ${esc(prettyDate(x.date))}, ${esc(x.start)}–${esc(x.end)}
         <div class="muted small-text">${esc(x.userName)}${x.vehicle ? ` · ${esc(x.vehicle)}` : ''} · ${esc((x.status || '').replace('_', ' '))} · booked ${esc(when(x.createdAt))}</div></div>`).join('') || '<p class="muted">No bookings yet.</p>'}</div>`;
 
+    el.querySelectorAll('[data-sugdone]').forEach((btn) => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try { await updateDoc(doc(db, 'stationSuggestions', btn.dataset.sugdone), { status: 'done', updatedAt: Date.now() }); }
+        catch (e) { console.error(e); toast('Could not update.'); }
+        renderAdmin();
+      };
+    });
     el.querySelectorAll('[data-resolve]').forEach((btn) => {
       btn.onclick = async () => {
         btn.disabled = true;
@@ -719,6 +796,9 @@ async function start() {
   state.byId = new Map(state.stations.map((s) => [s.id, s]));
   refresh();
   locate();
+  // Links ending in #feedback or #add-charger open that form directly.
+  if (location.hash === '#feedback') openFeedback();
+  if (location.hash === '#add-charger') openMissingCharger();
   onSnapshot(collection(db, 'partners'), (snap) => {
     state.partners = new Map(snap.docs.map((d) => [d.id, d.data()]));
     refresh(); refreshOwnerTab();
