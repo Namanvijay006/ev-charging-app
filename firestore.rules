@@ -1,0 +1,60 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function email() { return request.auth.token.email.lower(); }
+    // Admins are listed here. Keep in sync with ADMIN_EMAILS in docs/firebase-config.js.
+    function isAdmin() { return signedIn() && email() in ['evchargingfinder@gmail.com']; }
+    function partner(stationId) { return get(/databases/$(database)/documents/partners/$(stationId)).data; }
+
+    // A user's own profile.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    // Partner stations: live charger status, opening hours, price. Public to read.
+    match /partners/{stationId} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (signedIn() && resource.data.ownerEmail == email()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['chargers', 'updatedAt']));
+    }
+
+    // One document per charger per 30-minute slot. It can be created but never overwritten,
+    // which is what makes double booking impossible.
+    match /slotLocks/{lockId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && lockId == request.resource.data.stationId + '_' + request.resource.data.chargerId + '_'
+                     + request.resource.data.date + '_' + request.resource.data.time.replace(':', '')
+        && partner(request.resource.data.stationId).bookable == true;
+      allow update: if false;
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin()
+        || partner(resource.data.stationId).ownerEmail == email());
+    }
+
+    match /bookings/{bookingId} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid
+        || resource.data.ownerEmail == email() || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'confirmed'
+        && request.resource.data.slotIds.size() >= 1 && request.resource.data.slotIds.size() <= 4
+        && request.resource.data.ownerEmail == partner(request.resource.data.stationId).ownerEmail;
+      // Drivers may cancel their own booking; owners and admins may mark completed or no-show.
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        && ((resource.data.uid == request.auth.uid && request.resource.data.status == 'cancelled')
+            || resource.data.ownerEmail == email() || isAdmin());
+      allow delete: if false;
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow read, update: if isAdmin();
+    }
+  }
+}

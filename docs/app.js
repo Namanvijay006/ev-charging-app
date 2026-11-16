@@ -1,0 +1,544 @@
+import { firebaseConfig, ADMIN_EMAILS } from './firebase-config.js';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+import {
+  getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut,
+} from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+import {
+  getFirestore, collection, doc, getDoc, setDoc, updateDoc, deleteDoc, addDoc, getDocs,
+  onSnapshot, query, where, writeBatch,
+} from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const BLR = [12.9716, 77.5946];
+const SLOT_MIN = 30;
+const MAX_SLOTS = 4;
+const MAX_UPCOMING = 2;
+const DAYS_AHEAD = 7;
+const STATUS_LABEL = { available: 'Available', in_use: 'In use', busy: 'Busy', offline: 'Offline', unknown: 'Status unknown' };
+const STATUS_COLOR = { available: '#12a150', busy: '#d93025', offline: '#5f6368', unknown: '#5b7bb5' };
+
+const state = {
+  stations: [], byId: new Map(), partners: new Map(),
+  user: null, profile: null, pos: null,
+  filters: { plug: '', fast: false, bookable: false },
+  markers: new Map(), unsubSlots: null,
+};
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad = (n) => String(n).padStart(2, '0');
+const dateStr = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const toMin = (hhmm) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+const fromMin = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+const myEmail = () => (state.user?.email || '').toLowerCase();
+const isAdmin = () => !!state.user && ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(myEmail());
+const prettyDate = (s) => new Date(`${s}T00:00`).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+
+function toast(msg, ms = 3200) {
+  const t = $('toast');
+  t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.hidden = true; }, ms);
+}
+
+function km(a, b) {
+  const R = 6371, rad = (x) => (x * Math.PI) / 180;
+  const dLat = rad(b[0] - a[0]), dLng = rad(b[1] - a[1]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+const partnerOf = (s) => state.partners.get(s.id);
+const chargerStatus = (s, c) => partnerOf(s)?.chargers?.[c.id]?.status || 'unknown';
+const priceOf = (s) => partnerOf(s)?.pricePerKwh ?? s.pricePerKwh;
+const maxKw = (s) => Math.max(0, ...s.chargers.map((c) => c.kw || 0));
+const isBookable = (s) => !!partnerOf(s)?.bookable;
+
+function stationStatus(s) {
+  const p = partnerOf(s);
+  if (!p) return 'unknown';
+  const st = s.chargers.map((c) => chargerStatus(s, c));
+  if (st.includes('available')) return 'available';
+  if (st.includes('in_use')) return 'busy';
+  if (st.every((x) => x === 'offline')) return 'offline';
+  return 'unknown';
+}
+
+// ---------- map ----------
+const map = L.map('map', { zoomControl: false }).setView(BLR, 12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors',
+}).addTo(map);
+let meMarker = null;
+
+function locate(pan) {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition((p) => {
+    state.pos = [p.coords.latitude, p.coords.longitude];
+    if (meMarker) meMarker.setLatLng(state.pos);
+    else meMarker = L.circleMarker(state.pos, { radius: 7, color: '#fff', weight: 2, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(map);
+    if (pan) map.setView(state.pos, 14);
+    renderList();
+  }, () => { if (pan) toast('Location not available. Showing Bengaluru.'); }, { enableHighAccuracy: true, timeout: 8000 });
+}
+$('btn-locate').onclick = () => locate(true);
+
+function passesFilters(s) {
+  const f = state.filters;
+  if (f.plug && !s.chargers.some((c) => c.plug === f.plug)) return false;
+  if (f.fast && maxKw(s) < 25) return false;
+  if (f.bookable && !isBookable(s)) return false;
+  return true;
+}
+
+function renderMarkers() {
+  for (const s of state.stations) {
+    let m = state.markers.get(s.id);
+    const show = passesFilters(s);
+    const status = stationStatus(s);
+    const style = { radius: isBookable(s) ? 9 : 7, color: '#fff', weight: 2, fillColor: STATUS_COLOR[status], fillOpacity: 0.95 };
+    if (!m) {
+      m = L.circleMarker([s.lat, s.lng], style).on('click', () => openStation(s.id));
+      state.markers.set(s.id, m);
+    } else m.setStyle(style);
+    if (show && !map.hasLayer(m)) m.addTo(map);
+    if (!show && map.hasLayer(m)) m.remove();
+  }
+}
+
+function renderFilters() {
+  const f = state.filters;
+  const plugs = ['CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC'];
+  $('filters').innerHTML =
+    `<button class="chip ${f.bookable ? 'on' : ''}" data-f="bookable">Bookable</button>` +
+    `<button class="chip ${f.fast ? 'on' : ''}" data-f="fast">Fast (25 kW+)</button>` +
+    plugs.map((p) => `<button class="chip ${f.plug === p ? 'on' : ''}" data-plug="${esc(p)}">${esc(p)}</button>`).join('');
+}
+$('filters').onclick = (e) => {
+  const b = e.target.closest('.chip'); if (!b) return;
+  if (b.dataset.f) state.filters[b.dataset.f] = !state.filters[b.dataset.f];
+  if (b.dataset.plug) state.filters.plug = state.filters.plug === b.dataset.plug ? '' : b.dataset.plug;
+  renderFilters(); renderMarkers(); renderList();
+};
+
+function renderList() {
+  const origin = state.pos || BLR;
+  const rows = state.stations.filter(passesFilters)
+    .map((s) => ({ s, d: km(origin, [s.lat, s.lng]) }))
+    .sort((a, b) => a.d - b.d).slice(0, 40);
+  $('station-list').innerHTML = rows.length ? rows.map(({ s, d }) => {
+    const st = stationStatus(s), price = priceOf(s), kw = maxKw(s);
+    return `<button class="card" data-station="${esc(s.id)}">
+      <div class="row"><span class="title">${esc(s.name)}</span><span class="badge ${st}">${STATUS_LABEL[st]}</span></div>
+      <div class="muted small-text">${d.toFixed(1)} km${kw ? ` · up to ${kw} kW` : ''}${price ? ` · ₹${price}/kWh` : ''}${s.operator ? ` · ${esc(s.operator)}` : ''}</div>
+      ${isBookable(s) ? '<span class="badge neutral">Book a slot</span>' : ''}
+    </button>`;
+  }).join('') : '<div class="empty">No stations match these filters.</div>';
+}
+$('station-list').onclick = (e) => {
+  const c = e.target.closest('[data-station]'); if (c) openStation(c.dataset.station);
+};
+
+// ---------- sheet ----------
+function openSheet(html) { $('sheet-body').innerHTML = html; $('sheet').hidden = false; }
+function closeSheet() {
+  $('sheet').hidden = true;
+  if (state.unsubSlots) { state.unsubSlots(); state.unsubSlots = null; }
+}
+$('sheet').addEventListener('click', (e) => { if (e.target.closest('[data-close]')) closeSheet(); });
+
+// ---------- station details ----------
+function openStation(id) {
+  const s = state.byId.get(id); if (!s) return;
+  if (state.unsubSlots) { state.unsubSlots(); state.unsubSlots = null; }
+  const p = partnerOf(s), st = stationStatus(s), price = priceOf(s);
+  const nav = `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}`;
+  const chargers = s.chargers.map((c, i) => {
+    const cs = chargerStatus(s, c);
+    const canBook = isBookable(s) && cs !== 'offline';
+    return `<div class="charger">
+      <div><strong>Charger ${i + 1}</strong> · ${esc(c.plug)}${c.kw ? ` · ${c.kw} kW` : ''}<br>
+        <span class="badge ${cs}">${STATUS_LABEL[cs]}</span></div>
+      ${canBook ? `<button class="btn small" data-book="${esc(c.id)}">Book</button>` : ''}
+    </div>`;
+  }).join('');
+  openSheet(`
+    <h2>${esc(s.name)}</h2>
+    <p class="muted">${esc(s.address)}</p>
+    <p><span class="badge ${st}">${STATUS_LABEL[st]}</span>
+      ${p ? '<span class="badge neutral">Partner station</span>' : ''}</p>
+    <p class="small-text muted">${s.operator ? `Operator: ${esc(s.operator)} · ` : ''}${price ? `₹${price}/kWh · ` : ''}${p ? `Open ${esc(p.openTime)}–${esc(p.closeTime)}` : (s.verified ? `Info last verified ${esc(s.verified)}` : '')}</p>
+    ${p ? '' : '<div class="note">We do not have live status for this station yet, so it cannot be booked here. You can still navigate to it.</div>'}
+    <div class="actions">
+      <a class="btn" href="${nav}" target="_blank" rel="noopener">Navigate</a>
+      <button class="btn ghost" data-report>Report a problem</button>
+    </div>
+    <h3>Chargers (${s.chargers.length})</h3>
+    ${chargers}
+    ${isAdmin() ? adminPartnerForm(s) : ''}
+  `);
+  const body = $('sheet-body');
+  body.querySelectorAll('[data-book]').forEach((b) => { b.onclick = () => openSlots(s, b.dataset.book); });
+  body.querySelector('[data-report]').onclick = () => openReport(s);
+  if (isAdmin()) wireAdminForm(s);
+  map.setView([s.lat, s.lng], Math.max(map.getZoom(), 14));
+}
+
+// ---------- slots and booking ----------
+function openSlots(s, chargerId, date = dateStr(new Date())) {
+  if (!state.user) { toast('Please sign in to book a slot.'); return signIn(); }
+  const p = partnerOf(s); if (!p) return;
+  const c = s.chargers.find((x) => x.id === chargerId);
+  const idx = s.chargers.indexOf(c);
+  const chargerKey = `${s.id}_${c.id}`;
+  let picked = [];
+  let taken = new Set();
+
+  const days = Array.from({ length: DAYS_AHEAD }, (_, i) => { const d = new Date(); d.setDate(d.getDate() + i); return dateStr(d); });
+  const allSlots = () => {
+    const out = [], now = new Date(), today = dateStr(now), nowMin = now.getHours() * 60 + now.getMinutes();
+    for (let m = toMin(p.openTime); m + SLOT_MIN <= toMin(p.closeTime); m += SLOT_MIN) {
+      if (date === today && m <= nowMin) continue;
+      out.push(fromMin(m));
+    }
+    return out;
+  };
+
+  const draw = () => {
+    const slots = allSlots();
+    picked = picked.filter((t) => !taken.has(t));
+    const hours = (picked.length * SLOT_MIN) / 60, price = priceOf(s);
+    const est = price && c.kw ? Math.round(Math.min(c.kw * hours, 60) * price) : null;
+    openSheetKeep(`
+      <button class="btn small ghost" data-back>← Back</button>
+      <h2 style="margin-top:10px">${esc(s.name)}</h2>
+      <p class="muted">Charger ${idx + 1} · ${esc(c.plug)}${c.kw ? ` · ${c.kw} kW` : ''}</p>
+      <div class="dates">${days.map((d) => `<button class="chip ${d === date ? 'on' : ''}" data-date="${d}">${esc(prettyDate(d))}</button>`).join('')}</div>
+      <p class="small-text muted">Pick up to ${MAX_SLOTS} slots in a row (${SLOT_MIN} minutes each).</p>
+      <div class="slots">${slots.length ? slots.map((t) => `<button class="slot ${taken.has(t) ? 'taken' : ''} ${picked.includes(t) ? 'picked' : ''}" data-slot="${t}" ${taken.has(t) ? 'disabled' : ''}>${t}</button>`).join('') : '<p class="muted">No slots left on this day.</p>'}</div>
+      ${picked.length ? `<div class="summary"><strong>${esc(prettyDate(date))}, ${picked[0]}–${fromMin(toMin(picked[picked.length - 1]) + SLOT_MIN)}</strong><br>
+        <span class="small-text">${est ? `Estimated up to ₹${est}. ` : ''}Booking is free. Pay for charging at the station.</span></div>
+        <button class="btn block" data-confirm>Confirm booking</button>` : ''}
+    `);
+    const body = $('sheet-body');
+    body.querySelector('[data-back]').onclick = () => openStation(s.id);
+    body.querySelectorAll('[data-date]').forEach((b) => { b.onclick = () => openSlots(s, chargerId, b.dataset.date); });
+    body.querySelectorAll('[data-slot]').forEach((b) => { b.onclick = () => { pick(b.dataset.slot); draw(); }; });
+    const cf = body.querySelector('[data-confirm]');
+    if (cf) cf.onclick = () => confirmBooking(s, c, idx, date, picked, cf);
+  };
+
+  const pick = (t) => {
+    const m = toMin(t);
+    if (!picked.length) { picked = [t]; return; }
+    const first = toMin(picked[0]), last = toMin(picked[picked.length - 1]);
+    if (picked.includes(t)) picked = [];
+    else if (m === last + SLOT_MIN && picked.length < MAX_SLOTS) picked.push(t);
+    else if (m === first - SLOT_MIN && picked.length < MAX_SLOTS) picked.unshift(t);
+    else picked = [t];
+  };
+
+  if (state.unsubSlots) state.unsubSlots();
+  draw();
+  state.unsubSlots = onSnapshot(
+    query(collection(db, 'slotLocks'), where('chargerKey', '==', chargerKey), where('date', '==', date)),
+    (snap) => { taken = new Set(snap.docs.map((d) => d.data().time)); draw(); },
+    (err) => console.error(err),
+  );
+}
+// Re-render the sheet without tearing down the live slot listener.
+function openSheetKeep(html) { $('sheet-body').innerHTML = html; $('sheet').hidden = false; }
+
+async function confirmBooking(s, c, idx, date, picked, btn) {
+  btn.disabled = true; btn.textContent = 'Booking…';
+  try {
+    const mine = await getDocs(query(collection(db, 'bookings'), where('uid', '==', state.user.uid)));
+    const upcoming = mine.docs.map((d) => d.data()).filter((b) => b.status === 'confirmed' && new Date(`${b.date}T${b.end}`) > new Date());
+    if (upcoming.length >= MAX_UPCOMING) {
+      toast(`You already have ${MAX_UPCOMING} upcoming bookings. Cancel one to book again.`);
+      btn.disabled = false; btn.textContent = 'Confirm booking'; return;
+    }
+    const p = partnerOf(s);
+    const bookingRef = doc(collection(db, 'bookings'));
+    const slotIds = picked.map((t) => `${s.id}_${c.id}_${date}_${t.replace(':', '')}`);
+    const code = 'EV-' + Array.from({ length: 5 }, () => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 31)]).join('');
+    const batch = writeBatch(db);
+    // Each slot is its own document. The security rules refuse to overwrite an existing
+    // lock, so if anyone else holds one of these slots the whole booking fails.
+    picked.forEach((t, i) => batch.set(doc(db, 'slotLocks', slotIds[i]), {
+      uid: state.user.uid, bookingId: bookingRef.id, stationId: s.id, chargerId: c.id,
+      chargerKey: `${s.id}_${c.id}`, date, time: t, createdAt: Date.now(),
+    }));
+    batch.set(bookingRef, {
+      uid: state.user.uid,
+      userName: (state.profile?.name || state.user.displayName || 'Driver').split(' ')[0],
+      vehicle: state.profile?.vehicle || '',
+      stationId: s.id, stationName: s.name, ownerEmail: p.ownerEmail,
+      chargerId: c.id, chargerLabel: `Charger ${idx + 1} · ${c.plug}${c.kw ? ` · ${c.kw} kW` : ''}`,
+      date, start: picked[0], end: fromMin(toMin(picked[picked.length - 1]) + SLOT_MIN),
+      slotIds, status: 'confirmed', code, createdAt: Date.now(),
+    });
+    await batch.commit();
+    closeSheet();
+    openSheet(`
+      <h2>Booking confirmed</h2>
+      <p>${esc(s.name)}<br><span class="muted">${esc(prettyDate(date))}, ${picked[0]}–${fromMin(toMin(picked[picked.length - 1]) + SLOT_MIN)}</span></p>
+      <div class="summary">Show this code at the station: <span class="code">${code}</span></div>
+      <p class="small-text muted">Please arrive within 15 minutes of your start time. Pay for charging at the station.</p>
+      <div class="actions">
+        <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}" target="_blank" rel="noopener">Navigate</a>
+        <button class="btn ghost" data-close>Done</button>
+      </div>`);
+  } catch (err) {
+    console.error(err);
+    toast(err.code === 'permission-denied' ? 'Sorry, one of those slots was just booked. Please pick again.' : 'Booking failed. Check your internet and try again.');
+    if (btn.isConnected) { btn.disabled = false; btn.textContent = 'Confirm booking'; }
+  }
+}
+
+async function cancelBooking(b, id, newStatus = 'cancelled') {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'bookings', id), { status: newStatus, updatedAt: Date.now() });
+  (b.slotIds || []).forEach((sid) => batch.delete(doc(db, 'slotLocks', sid)));
+  await batch.commit();
+}
+
+// ---------- my bookings ----------
+async function renderBookings() {
+  const el = $('bookings');
+  if (!state.user) { el.innerHTML = signInPrompt('Sign in to see your bookings.'); wireSignIn(el); return; }
+  el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const snap = await getDocs(query(collection(db, 'bookings'), where('uid', '==', state.user.uid)));
+    const all = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (`${b.date}${b.start}`).localeCompare(`${a.date}${a.start}`));
+    const now = new Date();
+    const isUp = (b) => b.status === 'confirmed' && new Date(`${b.date}T${b.end}`) > now;
+    const up = all.filter(isUp).reverse(), past = all.filter((b) => !isUp(b));
+    const card = (b, upcoming) => `<div class="card">
+      <div class="row"><span class="title">${esc(b.stationName)}</span><span class="badge ${b.status === 'confirmed' ? 'available' : 'offline'}">${esc(b.status.replace('_', ' '))}</span></div>
+      <div class="muted small-text">${esc(prettyDate(b.date))}, ${esc(b.start)}–${esc(b.end)} · ${esc(b.chargerLabel)}</div>
+      <div class="small-text">Code <span class="code">${esc(b.code)}</span></div>
+      ${upcoming ? `<div class="actions"><button class="btn small ghost" data-nav="${esc(b.stationId)}">Navigate</button><button class="btn small danger" data-cancel="${esc(b.id)}">Cancel</button></div>` : ''}
+    </div>`;
+    el.innerHTML = `<h2>My bookings</h2>
+      <h3>Upcoming</h3><div class="list" style="padding:0">${up.map((b) => card(b, true)).join('') || '<div class="empty">No upcoming bookings. Find a partner station on the map to book.</div>'}</div>
+      <h3>Past</h3><div class="list" style="padding:0">${past.map((b) => card(b, false)).join('') || '<p class="muted">Nothing here yet.</p>'}</div>`;
+    el.querySelectorAll('[data-cancel]').forEach((btn) => {
+      btn.onclick = async () => {
+        if (!confirm('Cancel this booking?')) return;
+        btn.disabled = true;
+        try { await cancelBooking(all.find((x) => x.id === btn.dataset.cancel), btn.dataset.cancel); toast('Booking cancelled.'); }
+        catch (e) { console.error(e); toast('Could not cancel. Try again.'); }
+        renderBookings();
+      };
+    });
+    el.querySelectorAll('[data-nav]').forEach((btn) => {
+      btn.onclick = () => { const s = state.byId.get(btn.dataset.nav); if (s) window.open(`https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}`, '_blank', 'noopener'); };
+    });
+  } catch (e) { console.error(e); el.innerHTML = '<div class="empty">Could not load bookings. Check your internet.</div>'; }
+}
+
+// ---------- owner panel ----------
+const myStations = () => state.stations.filter((s) => partnerOf(s)?.ownerEmail === myEmail() && myEmail());
+
+async function renderOwner() {
+  const el = $('owner');
+  const mine = myStations();
+  if (!mine.length) { el.innerHTML = '<div class="empty">No stations are linked to your account.</div>'; return; }
+  let bookings = [];
+  try {
+    const snap = await getDocs(query(collection(db, 'bookings'), where('ownerEmail', '==', myEmail())));
+    bookings = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (e) { console.error(e); }
+  const today = dateStr(new Date());
+  el.innerHTML = '<h2>My stations</h2><p class="muted small-text">Keep each charger\'s status up to date so drivers can trust it.</p>' + mine.map((s) => {
+    const up = bookings.filter((b) => b.stationId === s.id && b.status === 'confirmed' && b.date >= today)
+      .sort((a, b) => (`${a.date}${a.start}`).localeCompare(`${b.date}${b.start}`));
+    return `<h3>${esc(s.name)}</h3><div class="card">
+      ${s.chargers.map((c, i) => {
+        const cs = chargerStatus(s, c);
+        return `<div class="charger"><div><strong>Charger ${i + 1}</strong><br><span class="muted small-text">${esc(c.plug)}${c.kw ? ` · ${c.kw} kW` : ''}</span></div>
+          <div class="seg">${['available', 'in_use', 'offline'].map((v) => `<button class="${v} ${cs === v ? 'on' : ''}" data-status="${v}" data-s="${esc(s.id)}" data-c="${esc(c.id)}">${STATUS_LABEL[v]}</button>`).join('')}</div></div>`;
+      }).join('')}
+    </div>
+    <h3>Upcoming bookings (${up.length})</h3>
+    <div class="list" style="padding:0">${up.map((b) => `<div class="card">
+      <div class="row"><span class="title">${esc(prettyDate(b.date))}, ${esc(b.start)}–${esc(b.end)}</span><span class="code">${esc(b.code)}</span></div>
+      <div class="muted small-text">${esc(b.chargerLabel)} · ${esc(b.userName)}${b.vehicle ? ` · ${esc(b.vehicle)}` : ''}</div>
+      <div class="actions"><button class="btn small" data-done="${esc(b.id)}">Completed</button><button class="btn small danger" data-noshow="${esc(b.id)}">No-show</button></div>
+    </div>`).join('') || '<p class="muted">No upcoming bookings.</p>'}</div>`;
+  }).join('');
+
+  el.querySelectorAll('[data-status]').forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await updateDoc(doc(db, 'partners', btn.dataset.s), { [`chargers.${btn.dataset.c}`]: { status: btn.dataset.status, updatedAt: Date.now() } });
+      } catch (e) { console.error(e); toast('Could not update status.'); }
+    };
+  });
+  const finish = (attr, status, free) => el.querySelectorAll(`[${attr}]`).forEach((btn) => {
+    btn.onclick = async () => {
+      const id = btn.getAttribute(attr), b = bookings.find((x) => x.id === id);
+      btn.disabled = true;
+      try {
+        if (free) await cancelBooking(b, id, status);
+        else await updateDoc(doc(db, 'bookings', id), { status, updatedAt: Date.now() });
+        toast('Updated.');
+      } catch (e) { console.error(e); toast('Could not update.'); }
+      renderOwner();
+    };
+  });
+  finish('data-done', 'completed', false);
+  finish('data-noshow', 'no_show', true);
+}
+
+// ---------- admin: make a station a bookable partner ----------
+function adminPartnerForm(s) {
+  const p = partnerOf(s);
+  return `<h3>Admin: partner settings</h3>
+    <div class="card">
+      <label>Owner's Google email (they manage status and see bookings)</label>
+      <input type="email" id="ad-email" value="${esc(p?.ownerEmail || '')}" placeholder="owner@gmail.com">
+      <div style="display:flex;gap:8px">
+        <div style="flex:1"><label>Opens</label><input type="time" id="ad-open" value="${esc(p?.openTime || '06:00')}"></div>
+        <div style="flex:1"><label>Closes</label><input type="time" id="ad-close" value="${esc(p?.closeTime || '23:00')}"></div>
+      </div>
+      <label>Price (₹ per kWh)</label>
+      <input type="number" id="ad-price" min="0" step="0.5" value="${esc(p?.pricePerKwh ?? s.pricePerKwh ?? '')}">
+      <label><input type="checkbox" id="ad-bookable" ${p?.bookable === false ? '' : 'checked'}> Allow slot booking</label>
+      <div class="actions">
+        <button class="btn small" id="ad-save">${p ? 'Save' : 'Make partner station'}</button>
+        ${p ? '<button class="btn small danger" id="ad-remove">Remove partner</button>' : ''}
+      </div>
+    </div>`;
+}
+function wireAdminForm(s) {
+  $('ad-save').onclick = async () => {
+    const email = $('ad-email').value.trim().toLowerCase();
+    const open = $('ad-open').value, close = $('ad-close').value;
+    if (!email || !email.includes('@')) return toast('Enter the owner\'s email.');
+    if (!open || !close || toMin(close) <= toMin(open)) return toast('Closing time must be after opening time.');
+    const existing = partnerOf(s);
+    const chargers = existing?.chargers || Object.fromEntries(s.chargers.map((c) => [c.id, { status: 'available', updatedAt: Date.now() }]));
+    const price = $('ad-price').value === '' ? null : Number($('ad-price').value);
+    try {
+      await setDoc(doc(db, 'partners', s.id), { ownerEmail: email, openTime: open, closeTime: close, pricePerKwh: price, bookable: $('ad-bookable').checked, chargers, updatedAt: Date.now() });
+      toast('Saved.'); closeSheet();
+    } catch (e) { console.error(e); toast('Could not save. Are you signed in as admin?'); }
+  };
+  const rm = $('ad-remove');
+  if (rm) rm.onclick = async () => {
+    if (!confirm('Remove this station as a partner? Existing bookings stay in the records.')) return;
+    try { await deleteDoc(doc(db, 'partners', s.id)); toast('Removed.'); closeSheet(); }
+    catch (e) { console.error(e); toast('Could not remove.'); }
+  };
+}
+
+// ---------- report a problem ----------
+function openReport(s) {
+  if (!state.user) { toast('Please sign in to report a problem.'); return signIn(); }
+  openSheet(`<h2>Report a problem</h2><p class="muted">${esc(s.name)}</p>
+    <label>What is wrong?</label>
+    <select id="rp-type"><option value="broken">Charger not working</option><option value="wrong_info">Wrong information</option><option value="blocked">Blocked by a parked vehicle</option><option value="closed">Station closed or removed</option><option value="other">Something else</option></select>
+    <label>Details (optional)</label><textarea id="rp-note" rows="3" maxlength="500"></textarea>
+    <div class="actions"><button class="btn" id="rp-send">Send report</button></div>`);
+  $('rp-send').onclick = async () => {
+    try {
+      await addDoc(collection(db, 'reports'), { stationId: s.id, stationName: s.name, uid: state.user.uid, type: $('rp-type').value, note: $('rp-note').value.slice(0, 500), status: 'new', createdAt: Date.now() });
+      toast('Thank you. We will check it.'); closeSheet();
+    } catch (e) { console.error(e); toast('Could not send. Try again.'); }
+  };
+}
+
+// ---------- profile and sign-in ----------
+const signInPrompt = (msg) => `<div class="empty"><p>${esc(msg)}</p><button class="btn" data-signin>Sign in with Google</button></div>`;
+const wireSignIn = (el) => el.querySelectorAll('[data-signin]').forEach((b) => { b.onclick = signIn; });
+
+async function signIn() {
+  const provider = new GoogleAuthProvider();
+  try { await signInWithPopup(auth, provider); }
+  catch (e) {
+    if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment') await signInWithRedirect(auth, provider);
+    else if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') { console.error(e); toast('Sign-in failed. Try again.'); }
+  }
+}
+$('btn-account').onclick = () => (state.user ? showView('profile') : signIn());
+
+function renderProfile() {
+  const el = $('profile');
+  if (!state.user) { el.innerHTML = signInPrompt('Sign in to book slots and save your vehicle.'); wireSignIn(el); return; }
+  const pr = state.profile || {};
+  const plugs = ['', 'CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC', 'Other / not sure'];
+  el.innerHTML = `<h2>Profile</h2><p class="muted">${esc(state.user.email)}${isAdmin() ? ' · Admin' : ''}</p>
+    <label>Name</label><input type="text" id="pf-name" maxlength="60" value="${esc(pr.name || state.user.displayName || '')}">
+    <label>Vehicle (for example, Tata Nexon EV)</label><input type="text" id="pf-vehicle" maxlength="60" value="${esc(pr.vehicle || '')}">
+    <label>Plug type</label><select id="pf-plug">${plugs.map((p) => `<option value="${esc(p)}" ${pr.plug === p ? 'selected' : ''}>${esc(p || 'Choose…')}</option>`).join('')}</select>
+    <div class="actions"><button class="btn" id="pf-save">Save</button><button class="btn ghost" id="pf-out">Sign out</button></div>
+    ${isAdmin() ? '<div class="note">Admin: open any station on the map and scroll down to turn it into a bookable partner station.</div>' : ''}
+    <p class="small-text muted">We store your name, email, vehicle and bookings to run this service. To delete your data, write to the support contact.</p>`;
+  $('pf-save').onclick = async () => {
+    const data = { name: $('pf-name').value.trim(), vehicle: $('pf-vehicle').value.trim(), plug: $('pf-plug').value, email: myEmail(), updatedAt: Date.now() };
+    try { await setDoc(doc(db, 'users', state.user.uid), data, { merge: true }); state.profile = { ...state.profile, ...data }; toast('Saved.'); }
+    catch (e) { console.error(e); toast('Could not save.'); }
+  };
+  $('pf-out').onclick = () => signOut(auth);
+}
+
+// ---------- navigation ----------
+function showView(name) {
+  document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
+  document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  if (name === 'map') setTimeout(() => map.invalidateSize(), 0);
+  if (name === 'bookings') renderBookings();
+  if (name === 'owner') renderOwner();
+  if (name === 'profile') renderProfile();
+}
+document.querySelector('.tabs').onclick = (e) => { const b = e.target.closest('button'); if (b) showView(b.dataset.view); };
+const activeView = () => document.querySelector('.view.active').id.replace('view-', '');
+
+function refreshOwnerTab() {
+  const has = myStations().length > 0;
+  $('tab-owner').hidden = !has;
+  if (!has && activeView() === 'owner') showView('map');
+}
+
+// ---------- start ----------
+onAuthStateChanged(auth, async (user) => {
+  state.user = user; state.profile = null;
+  $('btn-account').textContent = user ? (user.displayName || 'Account').split(' ')[0] : 'Sign in';
+  if (user) {
+    try {
+      const snap = await getDoc(doc(db, 'users', user.uid));
+      if (snap.exists()) state.profile = snap.data();
+      else {
+        state.profile = { name: user.displayName || '', email: myEmail(), vehicle: '', plug: '', createdAt: Date.now() };
+        await setDoc(doc(db, 'users', user.uid), state.profile);
+      }
+      if (state.profile.plug && !state.filters.plug && ['CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC'].includes(state.profile.plug)) {
+        state.filters.plug = state.profile.plug; renderFilters(); renderMarkers(); renderList();
+      }
+    } catch (e) { console.error(e); }
+  }
+  refreshOwnerTab();
+  showView(activeView());
+});
+
+async function start() {
+  renderFilters();
+  try {
+    state.stations = await (await fetch('stations.json')).json();
+  } catch (e) { console.error(e); toast('Could not load stations. Check your internet.'); return; }
+  state.byId = new Map(state.stations.map((s) => [s.id, s]));
+  renderMarkers(); renderList();
+  locate(true);
+  onSnapshot(collection(db, 'partners'), (snap) => {
+    state.partners = new Map(snap.docs.map((d) => [d.id, d.data()]));
+    renderMarkers(); renderList(); refreshOwnerTab();
+    if (activeView() === 'owner') renderOwner();
+  }, (err) => console.error(err));
+}
+start();
