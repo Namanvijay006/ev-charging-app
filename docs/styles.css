@@ -132,3 +132,17 @@ input[type=text], input[type=email], input[type=time], input[type=number], selec
   position: fixed; left: 50%; bottom: 76px; transform: translateX(-50%); z-index: 2000;
   background: #1f2a25; color: #fff; padding: 10px 16px; border-radius: 10px; max-width: 90vw; font-size: 14px;
 }
+
+.feedback-bar { text-align: center; padding: 16px 16px 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
+.tile .num { font-size: 26px; font-weight: 700; line-height: 1.1; }
+.tile .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.rating { display: flex; gap: 8px; }
+.rating button {
+  flex: 1; padding: 10px 0; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--card); font-weight: 700; cursor: pointer;
+}
+.rating button.on { background: var(--green); border-color: var(--green); color: #fff; }
+.rows { display: grid; gap: 8px; }
+.rowline { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; font-size: 14px; }

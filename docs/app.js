@@ -8,9 +8,17 @@ import {
   onSnapshot, query, where, writeBatch,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 
+import { getAnalytics, logEvent, isSupported } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-analytics.js';
+
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+
+// Anonymous usage statistics (Google Analytics). Never blocks the app if unavailable.
+let analytics = null;
+isSupported().then((ok) => { if (ok && firebaseConfig.measurementId) analytics = getAnalytics(app); }).catch(() => {});
+const track = (name, params = {}) => { try { if (analytics) logEvent(analytics, name, params); } catch (e) { /* ignore */ } };
+document.addEventListener('click', (e) => { if (e.target.closest('a[href*="google.com/maps/dir"]')) track('navigate_tap'); });
 
 const BLR = [12.9716, 77.5946];
 const SLOT_MIN = 30;
@@ -122,6 +130,7 @@ $('filters').onclick = (e) => {
   const b = e.target.closest('.chip'); if (!b) return;
   if (b.dataset.f) state.filters[b.dataset.f] = !state.filters[b.dataset.f];
   if (b.dataset.plug) state.filters.plug = state.filters.plug === b.dataset.plug ? '' : b.dataset.plug;
+  track('filter_used', { filter: b.dataset.f || b.dataset.plug });
   renderFilters(); renderMarkers(); renderList();
 };
 
@@ -154,6 +163,7 @@ $('sheet').addEventListener('click', (e) => { if (e.target.closest('[data-close]
 // ---------- station details ----------
 function openStation(id) {
   const s = state.byId.get(id); if (!s) return;
+  track('station_view', { station_id: s.id, bookable: isBookable(s) });
   if (state.unsubSlots) { state.unsubSlots(); state.unsubSlots = null; }
   const p = partnerOf(s), st = stationStatus(s), price = priceOf(s);
   const nav = `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}`;
@@ -172,7 +182,7 @@ function openStation(id) {
     <p><span class="badge ${st}">${STATUS_LABEL[st]}</span>
       ${p ? '<span class="badge neutral">Partner station</span>' : ''}</p>
     <p class="small-text muted">${s.operator ? `Operator: ${esc(s.operator)} · ` : ''}${price ? `₹${price}/kWh · ` : ''}${p ? `Open ${esc(p.openTime)}–${esc(p.closeTime)}` : (s.verified ? `Info last verified ${esc(s.verified)}` : '')}</p>
-    ${p ? '' : '<div class="note">We do not have live status for this station yet, so it cannot be booked here. You can still navigate to it.</div>'}
+    ${p ? '' : '<div class="note">We do not have live status for this station yet, so it cannot be booked here. You can still navigate to it.<br><button class="btn small ghost" data-want style="margin-top:8px">I would like to book this station</button></div>'}
     <div class="actions">
       <a class="btn" href="${nav}" target="_blank" rel="noopener">Navigate</a>
       <button class="btn ghost" data-report>Report a problem</button>
@@ -184,6 +194,8 @@ function openStation(id) {
   const body = $('sheet-body');
   body.querySelectorAll('[data-book]').forEach((b) => { b.onclick = () => openSlots(s, b.dataset.book); });
   body.querySelector('[data-report]').onclick = () => openReport(s);
+  const want = body.querySelector('[data-want]');
+  if (want) want.onclick = () => wantBooking(s, want);
   if (isAdmin()) wireAdminForm(s);
   map.setView([s.lat, s.lng], Math.max(map.getZoom(), 14));
 }
@@ -192,6 +204,7 @@ function openStation(id) {
 function openSlots(s, chargerId, date = dateStr(new Date())) {
   if (!state.user) { toast('Please sign in to book a slot.'); return signIn(); }
   const p = partnerOf(s); if (!p) return;
+  track('book_start', { station_id: s.id });
   const c = s.chargers.find((x) => x.id === chargerId);
   const idx = s.chargers.indexOf(c);
   const chargerKey = `${s.id}_${c.id}`;
@@ -283,6 +296,7 @@ async function confirmBooking(s, c, idx, date, picked, btn) {
       slotIds, status: 'confirmed', code, createdAt: Date.now(),
     });
     await batch.commit();
+    track('booking_confirmed', { station_id: s.id, slots: picked.length });
     closeSheet();
     openSheet(`
       <h2>Booking confirmed</h2>
@@ -460,7 +474,7 @@ const wireSignIn = (el) => el.querySelectorAll('[data-signin]').forEach((b) => {
 
 async function signIn() {
   const provider = new GoogleAuthProvider();
-  try { await signInWithPopup(auth, provider); }
+  try { await signInWithPopup(auth, provider); track('login', { method: 'google' }); }
   catch (e) {
     if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment') await signInWithRedirect(auth, provider);
     else if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') { console.error(e); toast('Sign-in failed. Try again.'); }
@@ -477,7 +491,7 @@ function renderProfile() {
     <label>Name</label><input type="text" id="pf-name" maxlength="60" value="${esc(pr.name || state.user.displayName || '')}">
     <label>Vehicle (for example, Tata Nexon EV)</label><input type="text" id="pf-vehicle" maxlength="60" value="${esc(pr.vehicle || '')}">
     <label>Plug type</label><select id="pf-plug">${plugs.map((p) => `<option value="${esc(p)}" ${pr.plug === p ? 'selected' : ''}>${esc(p || 'Choose…')}</option>`).join('')}</select>
-    <div class="actions"><button class="btn" id="pf-save">Save</button><button class="btn ghost" id="pf-out">Sign out</button></div>
+    <div class="actions"><button class="btn" id="pf-save">Save</button><button class="btn ghost" id="pf-fb">Give feedback</button><button class="btn ghost" id="pf-out">Sign out</button></div>
     ${isAdmin() ? '<div class="note">Admin: open any station on the map and scroll down to turn it into a bookable partner station.</div>' : ''}
     <p class="small-text muted">We store your name, email, vehicle and bookings to run this service. To delete your data, write to the support contact.</p>`;
   $('pf-save').onclick = async () => {
@@ -486,6 +500,118 @@ function renderProfile() {
     catch (e) { console.error(e); toast('Could not save.'); }
   };
   $('pf-out').onclick = () => signOut(auth);
+  $('pf-fb').onclick = openFeedback;
+}
+
+// ---------- feedback ----------
+function openFeedback() {
+  let rating = 0;
+  openSheet(`<h2>Help us improve</h2>
+    <p class="muted">Two quick questions. Your answer goes straight to the team.</p>
+    <label>How useful is this app for you? (1 = not useful, 5 = very useful)</label>
+    <div class="rating" id="fb-rating">${[1, 2, 3, 4, 5].map((n) => `<button data-n="${n}">${n}</button>`).join('')}</div>
+    <label>What should we add or fix? What were you hoping to do here?</label>
+    <textarea id="fb-note" rows="4" maxlength="1000" placeholder="For example: I want to book chargers at Phoenix Mall, or show which chargers are working right now"></textarea>
+    <label>${state.user ? `<input type="checkbox" id="fb-ok"> You may contact me at ${esc(state.user.email)}` : 'Phone or email, if we may contact you (optional)'}</label>
+    ${state.user ? '' : '<input type="text" id="fb-contact" maxlength="100">'}
+    <div class="actions"><button class="btn" id="fb-send">Send feedback</button></div>`);
+  $('fb-rating').onclick = (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    rating = Number(b.dataset.n);
+    $('fb-rating').querySelectorAll('button').forEach((x) => x.classList.toggle('on', Number(x.dataset.n) === rating));
+  };
+  $('fb-send').onclick = async () => {
+    const note = $('fb-note').value.trim().slice(0, 1000);
+    if (!rating && !note) return toast('Please choose a rating or write a line.');
+    const contact = state.user ? ($('fb-ok').checked ? myEmail() : '') : $('fb-contact').value.trim().slice(0, 100);
+    try {
+      await addDoc(collection(db, 'feedback'), { type: 'feedback', rating, note, contact, uid: state.user?.uid || null, stationId: '', stationName: '', createdAt: Date.now() });
+      track('feedback_sent', { rating });
+      toast('Thank you! We read every message.'); closeSheet();
+    } catch (e) { console.error(e); toast('Could not send. Try again.'); }
+  };
+}
+$('btn-feedback').onclick = openFeedback;
+
+async function wantBooking(s, btn) {
+  btn.disabled = true;
+  try {
+    await addDoc(collection(db, 'feedback'), { type: 'want_booking', rating: 0, note: '', contact: '', uid: state.user?.uid || null, stationId: s.id, stationName: s.name, createdAt: Date.now() });
+    track('want_booking', { station_id: s.id });
+    btn.textContent = 'Noted. We will try to add it.';
+  } catch (e) { console.error(e); btn.disabled = false; toast('Could not send. Try again.'); }
+}
+
+// ---------- admin dashboard ----------
+async function renderAdmin() {
+  const el = $('admin');
+  if (!isAdmin()) { el.innerHTML = '<div class="empty">Admins only.</div>'; return; }
+  el.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const [u, b, f, r] = await Promise.all(['users', 'bookings', 'feedback', 'reports'].map((c) => getDocs(collection(db, c))));
+    const rows = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const users = rows(u), bookings = rows(b), feedback = rows(f), reports = rows(r);
+    const now = Date.now(), week = now - 7 * 864e5;
+    const when = (ms) => (ms ? new Date(ms).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '');
+    const newest = (list) => [...list].sort((a, c) => (c.createdAt || 0) - (a.createdAt || 0));
+    const upcoming = bookings.filter((x) => x.status === 'confirmed' && new Date(`${x.date}T${x.end}`) > new Date());
+    const rated = feedback.filter((x) => x.type === 'feedback' && x.rating > 0);
+    const avg = rated.length ? (rated.reduce((n, x) => n + x.rating, 0) / rated.length).toFixed(1) : '–';
+    const wants = new Map();
+    feedback.filter((x) => x.type === 'want_booking').forEach((x) => wants.set(x.stationName, (wants.get(x.stationName) || 0) + 1));
+    const topWants = [...wants.entries()].sort((a, c) => c[1] - a[1]).slice(0, 10);
+    const openReports = newest(reports).filter((x) => x.status !== 'resolved');
+    const tile = (num, lbl) => `<div class="tile"><div class="num">${esc(num)}</div><div class="lbl">${esc(lbl)}</div></div>`;
+
+    el.innerHTML = `<h2>Admin dashboard</h2>
+      <p class="muted small-text">Signed-in users and bookings, live from the database. For visitor counts (including people who did not sign in), open
+        <a href="https://console.firebase.google.com/project/${esc(firebaseConfig.projectId)}/analytics" target="_blank" rel="noopener">Google Analytics</a>.</p>
+      <div class="tiles">
+        ${tile(users.length, 'Signed-up users')}
+        ${tile(users.filter((x) => (x.createdAt || 0) > week).length, 'New users, last 7 days')}
+        ${tile(users.filter((x) => (x.lastSeenAt || x.createdAt || 0) > week).length, 'Active users, last 7 days')}
+        ${tile(state.partners.size, 'Partner stations')}
+        ${tile(bookings.length, 'Bookings, all time')}
+        ${tile(upcoming.length, 'Upcoming bookings')}
+        ${tile(bookings.filter((x) => x.status === 'cancelled').length, 'Cancelled')}
+        ${tile(bookings.filter((x) => x.status === 'no_show').length, 'No-shows')}
+        ${tile(avg, `Average rating (${rated.length} answers)`)}
+        ${tile(openReports.length, 'Open problem reports')}
+      </div>
+
+      <h3>Stations people want to book (${topWants.length})</h3>
+      <div class="rows">${topWants.map(([name, n]) => `<div class="rowline"><strong>${n}×</strong> ${esc(name)}</div>`).join('') || '<p class="muted">No requests yet.</p>'}</div>
+
+      <h3>Latest feedback</h3>
+      <div class="rows">${newest(feedback.filter((x) => x.type === 'feedback')).slice(0, 30).map((x) => `<div class="rowline">
+        ${x.rating ? `<span class="badge neutral">${x.rating}/5</span> ` : ''}${esc(x.note || '(no comment)')}
+        <div class="muted small-text">${esc(when(x.createdAt))}${x.contact ? ` · contact: ${esc(x.contact)}` : ''}</div></div>`).join('') || '<p class="muted">No feedback yet.</p>'}</div>
+
+      <h3>Open problem reports</h3>
+      <div class="rows">${openReports.slice(0, 30).map((x) => `<div class="rowline"><strong>${esc(x.stationName)}</strong> · ${esc((x.type || '').replace('_', ' '))}
+        ${x.note ? `<br>${esc(x.note)}` : ''}<div class="muted small-text">${esc(when(x.createdAt))}</div>
+        <button class="btn small ghost" data-resolve="${esc(x.id)}" style="margin-top:6px">Mark resolved</button></div>`).join('') || '<p class="muted">Nothing open.</p>'}</div>
+
+      <h3>Latest users</h3>
+      <div class="rows">${newest(users).slice(0, 30).map((x) => `<div class="rowline">${esc(x.name || '(no name)')} · ${esc(x.email || '')}
+        <div class="muted small-text">${esc([x.vehicle, x.plug].filter(Boolean).join(' · '))}${x.vehicle || x.plug ? ' · ' : ''}joined ${esc(when(x.createdAt))}</div></div>`).join('') || '<p class="muted">No users yet.</p>'}</div>
+
+      <h3>Latest bookings</h3>
+      <div class="rows">${newest(bookings).slice(0, 30).map((x) => `<div class="rowline"><strong>${esc(x.stationName)}</strong> · ${esc(prettyDate(x.date))}, ${esc(x.start)}–${esc(x.end)}
+        <div class="muted small-text">${esc(x.userName)}${x.vehicle ? ` · ${esc(x.vehicle)}` : ''} · ${esc((x.status || '').replace('_', ' '))} · booked ${esc(when(x.createdAt))}</div></div>`).join('') || '<p class="muted">No bookings yet.</p>'}</div>`;
+
+    el.querySelectorAll('[data-resolve]').forEach((btn) => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try { await updateDoc(doc(db, 'reports', btn.dataset.resolve), { status: 'resolved', updatedAt: Date.now() }); }
+        catch (e) { console.error(e); toast('Could not update.'); }
+        renderAdmin();
+      };
+    });
+  } catch (e) {
+    console.error(e);
+    el.innerHTML = '<div class="empty">Could not load the dashboard. Check that the latest database rules are published.</div>';
+  }
 }
 
 // ---------- navigation ----------
@@ -496,6 +622,7 @@ function showView(name) {
   if (name === 'bookings') renderBookings();
   if (name === 'owner') renderOwner();
   if (name === 'profile') renderProfile();
+  if (name === 'admin') renderAdmin();
 }
 document.querySelector('.tabs').onclick = (e) => { const b = e.target.closest('button'); if (b) showView(b.dataset.view); };
 const activeView = () => document.querySelector('.view.active').id.replace('view-', '');
@@ -504,6 +631,8 @@ function refreshOwnerTab() {
   const has = myStations().length > 0;
   $('tab-owner').hidden = !has;
   if (!has && activeView() === 'owner') showView('map');
+  $('tab-admin').hidden = !isAdmin();
+  if (!isAdmin() && activeView() === 'admin') showView('map');
 }
 
 // ---------- start ----------
@@ -513,9 +642,9 @@ onAuthStateChanged(auth, async (user) => {
   if (user) {
     try {
       const snap = await getDoc(doc(db, 'users', user.uid));
-      if (snap.exists()) state.profile = snap.data();
+      if (snap.exists()) { state.profile = snap.data(); updateDoc(doc(db, 'users', user.uid), { lastSeenAt: Date.now() }).catch(() => {}); }
       else {
-        state.profile = { name: user.displayName || '', email: myEmail(), vehicle: '', plug: '', createdAt: Date.now() };
+        state.profile = { name: user.displayName || '', email: myEmail(), vehicle: '', plug: '', createdAt: Date.now(), lastSeenAt: Date.now() };
         await setDoc(doc(db, 'users', user.uid), state.profile);
       }
       if (state.profile.plug && !state.filters.plug && ['CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC'].includes(state.profile.plug)) {

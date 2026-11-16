@@ -7,6 +7,7 @@ export const firebaseConfig = {
   storageBucket: 'ev-charging-app-259ca.firebasestorage.app',
   messagingSenderId: '121543080893',
   appId: '1:121543080893:web:30e0a99c68c656c565f0d4',
+  measurementId: 'G-101CR2R87N',
 };
 
 // Admins see the partner settings form. Keep in sync with isAdmin() in firestore.rules.

@@ -29,11 +29,13 @@
         <span><i class="dot unknown"></i>Status unknown</span>
       </div>
       <div id="station-list" class="list"></div>
+      <div class="feedback-bar"><button id="btn-feedback" class="btn small ghost">Give feedback or suggest a feature</button></div>
       <p class="credit">Station data © Open Charge Map contributors. Map © OpenStreetMap contributors.</p>
     </section>
 
     <section id="view-bookings" class="view"><div id="bookings" class="page"></div></section>
     <section id="view-owner" class="view"><div id="owner" class="page"></div></section>
+    <section id="view-admin" class="view"><div id="admin" class="page"></div></section>
     <section id="view-profile" class="view"><div id="profile" class="page"></div></section>
   </main>
 
@@ -41,6 +43,7 @@
     <button data-view="map" class="active">Map</button>
     <button data-view="bookings">Bookings</button>
     <button data-view="owner" id="tab-owner" hidden>My stations</button>
+    <button data-view="admin" id="tab-admin" hidden>Admin</button>
     <button data-view="profile">Profile</button>
   </nav>
 

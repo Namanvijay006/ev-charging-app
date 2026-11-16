@@ -10,7 +10,8 @@ service cloud.firestore {
 
     // A user's own profile.
     match /users/{uid} {
-      allow read, write: if signedIn() && request.auth.uid == uid;
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if signedIn() && request.auth.uid == uid;
     }
 
     // Partner stations: live charger status, opening hours, price. Public to read.
@@ -50,6 +51,18 @@ service cloud.firestore {
         && ((resource.data.uid == request.auth.uid && request.resource.data.status == 'cancelled')
             || resource.data.ownerEmail == email() || isAdmin());
       allow delete: if false;
+    }
+
+    // Feedback and "I want to book this station" requests. Anyone may send one,
+    // signed in or not; only admins can read them.
+    match /feedback/{feedbackId} {
+      allow create: if request.resource.data.keys().hasOnly(['type', 'rating', 'note', 'contact', 'uid', 'stationId', 'stationName', 'createdAt'])
+        && request.resource.data.type in ['feedback', 'want_booking']
+        && request.resource.data.note is string && request.resource.data.note.size() <= 1000
+        && request.resource.data.contact is string && request.resource.data.contact.size() <= 100
+        && request.resource.data.stationName is string && request.resource.data.stationName.size() <= 200
+        && (request.resource.data.uid == null || (signedIn() && request.resource.data.uid == request.auth.uid));
+      allow read, update, delete: if isAdmin();
     }
 
     match /reports/{reportId} {
