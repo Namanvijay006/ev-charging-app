@@ -92,12 +92,13 @@ button.card { cursor: pointer; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
 
-.sheet { position: fixed; inset: 0; z-index: 1000; }
+.sheet { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 12px; }
+.sheet[hidden] { display: none; }
 .sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.4); }
 .sheet-panel {
-  position: absolute; left: 0; right: 0; bottom: 0; max-height: 88vh; overflow-y: auto;
-  background: var(--card); border-radius: 18px 18px 0 0; padding: 20px 16px 28px;
-  max-width: 720px; margin: 0 auto;
+  position: relative; width: 100%; max-width: 560px; max-height: 88vh; overflow-y: auto;
+  background: var(--card); border-radius: 18px; padding: 20px 16px 22px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.3);
 }
 .sheet-close {
   position: sticky; top: 0; float: right; border: 0; background: var(--bg);
@@ -133,7 +134,6 @@ input[type=text], input[type=email], input[type=time], input[type=number], selec
   background: #1f2a25; color: #fff; padding: 10px 16px; border-radius: 10px; max-width: 90vw; font-size: 14px;
 }
 
-.feedback-bar { text-align: center; padding: 16px 16px 0; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
 .tile { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; }
 .tile .num { font-size: 26px; font-weight: 700; line-height: 1.1; }
@@ -146,3 +146,21 @@ input[type=text], input[type=email], input[type=time], input[type=number], selec
 .rating button.on { background: var(--green); border-color: var(--green); color: #fff; }
 .rows { display: grid; gap: 8px; }
 .rowline { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; font-size: 14px; }
+
+.top-actions { display: flex; gap: 8px; align-items: center; }
+.chip-gap { flex: none; width: 1px; background: var(--line); margin: 4px 2px; }
+.list-head { margin: 4px 0 2px; }
+.pin-wrap { background: none; border: 0; }
+.pin { display: flex; align-items: center; gap: 4px; white-space: nowrap; width: max-content; }
+.pin i {
+  flex: none; width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff;
+  background: var(--unknown); box-shadow: 0 1px 4px rgba(0,0,0,.45);
+}
+.pin.available i { background: var(--available); }
+.pin.busy i { background: var(--busy); }
+.pin.offline i { background: var(--offline); }
+.pin.bookable i { width: 20px; height: 20px; margin: -2px; }
+.pin span {
+  background: #fff; color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+  padding: 1px 6px; font-size: 12px; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.2);
+}

@@ -32,6 +32,7 @@ const state = {
   stations: [], byId: new Map(), partners: new Map(),
   user: null, profile: null, pos: null,
   filters: { plug: '', fast: false, bookable: false },
+  radius: 1, browse: false,
   markers: new Map(), unsubSlots: null,
 };
 
@@ -77,23 +78,37 @@ function stationStatus(s) {
 }
 
 // ---------- map ----------
-const map = L.map('map', { zoomControl: false }).setView(BLR, 12);
+const RADII = [1, 3, 5, 10, 25];
+const LABEL_LIMIT = 60;
+const map = L.map('map', { zoomControl: false }).setView(BLR, 14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19, attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
-let meMarker = null;
+let meMarker = null, radiusCircle = null;
 
-function locate(pan) {
-  if (!navigator.geolocation) return;
+// Chargers are shown around an origin: the person's location, or the map centre once they drag the map.
+const origin = () => (state.browse || !state.pos ? [map.getCenter().lat, map.getCenter().lng] : state.pos);
+const originLabel = () => (state.browse || !state.pos ? 'the map centre' : 'you');
+const pinName = (s) => s.operator || s.name;
+
+function fitRadius(centre) {
+  map.fitBounds(L.latLng(centre).toBounds(state.radius * 2000 * 1.2), { animate: false });
+}
+
+function locate() {
+  if (!navigator.geolocation) { refresh(); return; }
   navigator.geolocation.getCurrentPosition((p) => {
     state.pos = [p.coords.latitude, p.coords.longitude];
+    state.browse = false;
     if (meMarker) meMarker.setLatLng(state.pos);
     else meMarker = L.circleMarker(state.pos, { radius: 7, color: '#fff', weight: 2, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(map);
-    if (pan) map.setView(state.pos, 14);
-    renderList();
-  }, () => { if (pan) toast('Location not available. Showing Bengaluru.'); }, { enableHighAccuracy: true, timeout: 8000 });
+    fitRadius(state.pos);
+    refresh();
+  }, () => { toast('Location not available. Drag the map to your area to see chargers there.', 5000); refresh(); },
+  { enableHighAccuracy: true, timeout: 8000 });
 }
-$('btn-locate').onclick = () => locate(true);
+$('btn-locate').onclick = locate;
+map.on('dragend', () => { state.browse = true; refresh(); });
 
 function passesFilters(s) {
   const f = state.filters;
@@ -103,18 +118,37 @@ function passesFilters(s) {
   return true;
 }
 
-function renderMarkers() {
-  for (const s of state.stations) {
-    let m = state.markers.get(s.id);
-    const show = passesFilters(s);
-    const status = stationStatus(s);
-    const style = { radius: isBookable(s) ? 9 : 7, color: '#fff', weight: 2, fillColor: STATUS_COLOR[status], fillOpacity: 0.95 };
-    if (!m) {
-      m = L.circleMarker([s.lat, s.lng], style).on('click', () => openStation(s.id));
-      state.markers.set(s.id, m);
-    } else m.setStyle(style);
-    if (show && !map.hasLayer(m)) m.addTo(map);
-    if (!show && map.hasLayer(m)) m.remove();
+// Stations that pass the filters, with distance from the origin, nearest first.
+function ranked() {
+  const o = origin();
+  return state.stations.filter(passesFilters)
+    .map((s) => ({ s, d: km(o, [s.lat, s.lng]) }))
+    .sort((a, b) => a.d - b.d);
+}
+
+function refresh() {
+  const all = ranked();
+  const near = all.filter((r) => r.d <= state.radius);
+  renderMarkers(near);
+  renderList(near, all[0]);
+  const o = origin();
+  if (radiusCircle) radiusCircle.setLatLng(o).setRadius(state.radius * 1000);
+  else radiusCircle = L.circle(o, { radius: state.radius * 1000, color: '#0b7a4b', weight: 1, fillOpacity: 0.05, interactive: false }).addTo(map);
+}
+
+function renderMarkers(near) {
+  const keep = new Set(near.map((r) => r.s.id));
+  for (const [id, m] of state.markers) if (!keep.has(id)) { m.remove(); state.markers.delete(id); }
+  const labels = near.length <= LABEL_LIMIT;
+  for (const { s } of near) {
+    const name = pinName(s);
+    const icon = L.divIcon({
+      className: 'pin-wrap', iconSize: [16, 16], iconAnchor: [8, 8],
+      html: `<div class="pin ${stationStatus(s)} ${isBookable(s) ? 'bookable' : ''}"><i></i>${labels ? `<span>${esc(name.length > 24 ? `${name.slice(0, 23)}…` : name)}</span>` : ''}</div>`,
+    });
+    const m = state.markers.get(s.id);
+    if (m) m.setIcon(icon);
+    else state.markers.set(s.id, L.marker([s.lat, s.lng], { icon, title: name }).on('click', () => openStation(s.id)).addTo(map));
   }
 }
 
@@ -122,34 +156,55 @@ function renderFilters() {
   const f = state.filters;
   const plugs = ['CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC'];
   $('filters').innerHTML =
+    RADII.map((r) => `<button class="chip ${state.radius === r ? 'on' : ''}" data-radius="${r}">${r} km</button>`).join('') +
+    '<span class="chip-gap"></span>' +
     `<button class="chip ${f.bookable ? 'on' : ''}" data-f="bookable">Bookable</button>` +
     `<button class="chip ${f.fast ? 'on' : ''}" data-f="fast">Fast (25 kW+)</button>` +
     plugs.map((p) => `<button class="chip ${f.plug === p ? 'on' : ''}" data-plug="${esc(p)}">${esc(p)}</button>`).join('');
 }
+function setRadius(r) {
+  state.radius = r;
+  track('radius_changed', { km: r });
+  renderFilters(); fitRadius(origin()); refresh();
+}
 $('filters').onclick = (e) => {
   const b = e.target.closest('.chip'); if (!b) return;
+  if (b.dataset.radius) return setRadius(Number(b.dataset.radius));
   if (b.dataset.f) state.filters[b.dataset.f] = !state.filters[b.dataset.f];
   if (b.dataset.plug) state.filters.plug = state.filters.plug === b.dataset.plug ? '' : b.dataset.plug;
   track('filter_used', { filter: b.dataset.f || b.dataset.plug });
-  renderFilters(); renderMarkers(); renderList();
+  renderFilters(); refresh();
 };
 
-function renderList() {
-  const origin = state.pos || BLR;
-  const rows = state.stations.filter(passesFilters)
-    .map((s) => ({ s, d: km(origin, [s.lat, s.lng]) }))
-    .sort((a, b) => a.d - b.d).slice(0, 40);
-  $('station-list').innerHTML = rows.length ? rows.map(({ s, d }) => {
-    const st = stationStatus(s), price = priceOf(s), kw = maxKw(s);
-    return `<button class="card" data-station="${esc(s.id)}">
-      <div class="row"><span class="title">${esc(s.name)}</span><span class="badge ${st}">${STATUS_LABEL[st]}</span></div>
-      <div class="muted small-text">${d.toFixed(1)} km${kw ? ` · up to ${kw} kW` : ''}${price ? ` · ₹${price}/kWh` : ''}${s.operator ? ` · ${esc(s.operator)}` : ''}</div>
-      ${isBookable(s) ? '<span class="badge neutral">Book a slot</span>' : ''}
-    </button>`;
-  }).join('') : '<div class="empty">No stations match these filters.</div>';
+function renderList(near, nearest) {
+  const who = originLabel();
+  const head = `<p class="list-head"><strong>${near.length}</strong> charging station${near.length === 1 ? '' : 's'} within ${state.radius} km of ${who}</p>`;
+  if (near.length) {
+    $('station-list').innerHTML = head + near.slice(0, 100).map(({ s, d }) => {
+      const st = stationStatus(s), price = priceOf(s), kw = maxKw(s);
+      return `<button class="card" data-station="${esc(s.id)}">
+        <div class="row"><span class="title">${esc(pinName(s))}</span><span class="badge ${st}">${STATUS_LABEL[st]}</span></div>
+        ${s.operator ? `<div class="small-text">${esc(s.name)}</div>` : ''}
+        <div class="muted small-text">${d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`}${kw ? ` · up to ${kw} kW` : ''}${price ? ` · ₹${price}/kWh` : ''}</div>
+        ${isBookable(s) ? '<span class="badge neutral">Book a slot</span>' : ''}
+      </button>`;
+    }).join('');
+    return;
+  }
+  const wider = nearest ? RADII.find((r) => r > state.radius && r >= nearest.d) : null;
+  $('station-list').innerHTML = head + `<div class="empty">
+    ${nearest ? `<p>The nearest one we know of is <strong>${nearest.d.toFixed(1)} km</strong> away (${esc(pinName(nearest.s))}).</p>` : '<p>No stations match these filters.</p>'}
+    <div class="actions" style="justify-content:center">
+      ${wider ? `<button class="btn" data-widen="${wider}">Show within ${wider} km</button>` : (nearest ? `<button class="btn" data-goto="${esc(nearest.s.id)}">Show the nearest charger</button>` : '')}
+      <button class="btn ghost" data-missing>Know a charger that is missing? Tell us</button>
+    </div></div>`;
 }
 $('station-list').onclick = (e) => {
-  const c = e.target.closest('[data-station]'); if (c) openStation(c.dataset.station);
+  const c = e.target.closest('[data-station]'); if (c) return openStation(c.dataset.station);
+  const w = e.target.closest('[data-widen]'); if (w) return setRadius(Number(w.dataset.widen));
+  const g = e.target.closest('[data-goto]');
+  if (g) { const s = state.byId.get(g.dataset.goto); state.browse = true; map.setView([s.lat, s.lng], 14); refresh(); return openStation(s.id); }
+  if (e.target.closest('[data-missing]')) openFeedback();
 };
 
 // ---------- sheet ----------
@@ -648,7 +703,7 @@ onAuthStateChanged(auth, async (user) => {
         await setDoc(doc(db, 'users', user.uid), state.profile);
       }
       if (state.profile.plug && !state.filters.plug && ['CCS2', 'Type 2', 'CHAdeMO', 'GB/T DC'].includes(state.profile.plug)) {
-        state.filters.plug = state.profile.plug; renderFilters(); renderMarkers(); renderList();
+        state.filters.plug = state.profile.plug; renderFilters(); refresh();
       }
     } catch (e) { console.error(e); }
   }
@@ -662,11 +717,11 @@ async function start() {
     state.stations = await (await fetch('stations.json')).json();
   } catch (e) { console.error(e); toast('Could not load stations. Check your internet.'); return; }
   state.byId = new Map(state.stations.map((s) => [s.id, s]));
-  renderMarkers(); renderList();
-  locate(true);
+  refresh();
+  locate();
   onSnapshot(collection(db, 'partners'), (snap) => {
     state.partners = new Map(snap.docs.map((d) => [d.id, d.data()]));
-    renderMarkers(); renderList(); refreshOwnerTab();
+    refresh(); refreshOwnerTab();
     if (activeView() === 'owner') renderOwner();
   }, (err) => console.error(err));
 }

@@ -1,6 +1,6 @@
 # EV Charge
 
-A free web app to find EV charging stations in Bengaluru, see availability at partner
+A free web app to find EV charging stations near you (all of India), see availability at partner
 stations and book a 30-minute slot. Built to test product-market fit at zero cost.
 
 - **Live site:** https://namanvijay006.github.io/ev-charging-app/

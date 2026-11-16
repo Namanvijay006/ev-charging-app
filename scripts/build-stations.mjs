@@ -2,7 +2,7 @@
 // Usage: node scripts/build-stations.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const raw = JSON.parse(readFileSync('data/blr_stations_raw.json', 'utf8'));
+const raw = JSON.parse(readFileSync('data/in_stations_raw.json', 'utf8'));
 const ref = JSON.parse(readFileSync('data/ocm_reference.json', 'utf8'));
 
 const operators = new Map(ref.Operators.map((o) => [o.ID, o.Title]));
